@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LLMWATCH = os.path.join(ROOT, "llmwatch.py")
+SRC = os.path.join(ROOT, "src")
 
 
 def free_port():
@@ -130,18 +130,20 @@ def wait_for_proxy(port, proc):
 
 
 def main():
-    if not os.path.isfile(LLMWATCH):
-        raise RuntimeError("cannot find {}".format(LLMWATCH))
+    if not os.path.isfile(os.path.join(SRC, "llamawatch", "__main__.py")):
+        raise RuntimeError("cannot find the llamawatch package")
 
     upstream_port, proxy_port = free_port(), free_port()
     upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), MockLlama)
     thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     thread.start()
     proc = subprocess.Popen(
-        [sys.executable, LLMWATCH, "--listen", str(proxy_port),
+        [sys.executable, "-m", "llamawatch", "--listen", str(proxy_port),
          "--upstream-port", str(upstream_port), "--interval", "0.05",
          "--window", "60", "--ascii", "--no-color"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ,
+             "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", "")})
     try:
         wait_for_proxy(proxy_port, proc)
         streamed = request(proxy_port, {"stream": True, "prompt": "test"})

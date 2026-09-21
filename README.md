@@ -79,8 +79,8 @@ llama-watch --no-proxy
 llama-watch --ascii --no-color
 ```
 
-Use `llama-watch --help` for all options. The older `python llmwatch.py`
-launcher remains available in a source checkout for compatibility.
+Use `llama-watch --help` for all options. From an uninstalled checkout, run
+`PYTHONPATH=src python -m llamawatch`.
 
 ## Development
 
