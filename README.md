@@ -10,7 +10,9 @@ latency are measured from requests as they pass through the proxy.
 
 ## What it looks like
 
-A real run, mid-traffic, against a 4-slot `llama-server`:
+![llama-watch dashboard mid-traffic against a 4-slot llama-server](docs/screenshot.png)
+
+The same run, as plain text:
 
 ```
 llmwatch   proxy :8081 → :8080                                          19:40:45  last 60s  n=451
