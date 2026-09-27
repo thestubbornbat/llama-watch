@@ -262,6 +262,44 @@ def is_generation(path):
     return any(p.endswith(g) for g in GEN_PATHS)
 
 
+# Own introspection endpoint, served directly by the proxy rather than
+# forwarded upstream. Namespaced so it cannot collide with any real
+# llama.cpp route, present or future.
+METRICS_PATH = "/llmwatch/metrics"
+
+
+class RequestLog:
+    """Optional JSONL sink for every measured request record.
+
+    The rolling window in Stats holds at most 500 requests -- enough for the
+    dashboard, not enough for after-the-fact analysis or a long unattended
+    run. This writes the exact same record straight to disk instead, one line
+    per request, so nothing has to be kept in memory to look at it later.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.file = None
+
+    def open(self, path):
+        self.file = open(path, "a", buffering=1, encoding="utf-8")
+
+    def write(self, rec):
+        if not self.file or not rec:
+            return
+        line = json.dumps(rec)
+        with self.lock:
+            self.file.write(line + "\n")
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+
+LOG = RequestLog()
+
+
 # ---------------------------------------------------------------- stats
 
 
@@ -346,6 +384,13 @@ class Stats:
 STATS = Stats()
 
 
+def _finish(rec):
+    """Retire a completed request: feed the dashboard, and the log if enabled."""
+    STATS.finish(rec)
+    if rec:
+        LOG.write(rec)
+
+
 def pct(vals, p):
     if not vals:
         return None
@@ -375,6 +420,7 @@ def latency_meter(v, scale, width, good, bad):
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     upstream = ("127.0.0.1", 8080)
+    window = 60
 
     def log_message(self, *a):
         pass
@@ -390,6 +436,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _forward(self, method):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else None
+
+        # Own introspection endpoint: answered directly, never forwarded.
+        if method == "GET" and self.path.split("?", 1)[0] == METRICS_PATH:
+            self._serve_own_metrics()
+            return
+
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in HOP_BY_HOP}
         headers["Host"] = "{}:{}".format(*self.upstream)
@@ -421,6 +473,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
         except Exception:
             pass
+
+    def _serve_own_metrics(self):
+        body = render_own_metrics(self.window).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _write_chunk(self, data):
         self.wfile.write(("%X\r\n" % len(data)).encode() + data + b"\r\n")
@@ -464,10 +524,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._end_chunks()
         except Exception:
             if measured:
-                STATS.finish(None)
+                _finish(None)
             return
         if measured:
-            STATS.finish(_record(ttft, marks, final, t0))
+            _finish(_record(ttft, marks, final, t0))
 
     def _pump_plain(self, resp, measured=True):
         if measured:
@@ -480,7 +540,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._end_chunks()
         except Exception:
             if measured:
-                STATS.finish(None)
+                _finish(None)
             return
         if not measured:
             return
@@ -493,11 +553,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # reached here is a generation call we could not parse, so count it but
         # contribute no latency samples.
         if isinstance(obj, dict) and "timings" in obj:
-            STATS.finish(_record(None, [], obj, t0))
+            _finish(_record(None, [], obj, t0))
         else:
-            STATS.finish({"t": time.time(), "ttft": None, "itl": [],
-                          "prompt_n": None, "cache_n": None, "predicted_n": None,
-                          "total_ms": (time.perf_counter() - t0) * 1000.0})
+            _finish({"t": time.time(), "ttft": None, "itl": [],
+                     "prompt_n": None, "cache_n": None, "predicted_n": None,
+                     "total_ms": (time.perf_counter() - t0) * 1000.0})
 
 
 def _content_of(obj):
@@ -540,6 +600,67 @@ def _record(ttft, marks, final, t0):
                      or ("limit" if (final or {}).get("truncated") else None),
         "total_ms": (time.perf_counter() - t0) * 1000.0,
     }
+
+
+def render_own_metrics(window_s):
+    """Prometheus exposition of the numbers llama.cpp's own /metrics cannot
+    give you: these are derived from requests measured as they cross the
+    proxy, not from server-side counters. Scraping this is the graduate-from-
+    the-terminal path -- the same rolling window the dashboard shows, in a
+    form Prometheus/Grafana can ingest.
+    """
+    s = STATS.snapshot(window_s)
+    lines = []
+
+    def gauge(name, value, help_text, mtype="gauge"):
+        lines.append("# HELP {} {}".format(name, help_text))
+        lines.append("# TYPE {} {}".format(name, mtype))
+        lines.append("{} {}".format(name, 0 if value is None else value))
+
+    def summary(name, vals, help_text):
+        if not vals:
+            return
+        lines.append("# HELP {} {}".format(name, help_text))
+        lines.append("# TYPE {} summary".format(name))
+        for q in (0.5, 0.95, 0.99):
+            lines.append('{}{{quantile="{}"}} {}'.format(name, q, pct(vals, q * 100)))
+
+    gauge("llmwatch_window_seconds", window_s,
+          "Rolling window size backing these metrics.")
+    gauge("llmwatch_requests_in_window", s.get("n", 0),
+          "Completed generation requests observed in the window.")
+    gauge("llmwatch_requests_inflight", s.get("inflight", 0),
+          "Generation requests currently in progress.")
+    gauge("llmwatch_requests_total", s.get("total", 0),
+          "Requests proxied since start.", "counter")
+    gauge("llmwatch_proxy_errors_total", s.get("errors", 0),
+          "Requests that failed before completion.", "counter")
+    gauge("llmwatch_cache_reused_tokens_total", s.get("reused", 0),
+          "Prompt tokens served from cache in the window.", "counter")
+    gauge("llmwatch_cache_fresh_tokens_total", s.get("fresh", 0),
+          "Prompt tokens freshly evaluated in the window.", "counter")
+    if s.get("hit") is not None:
+        gauge("llmwatch_cache_hit_ratio", s["hit"],
+              "Fraction of prompt tokens served from cache in the window.")
+    if s.get("cold_frac") is not None:
+        gauge("llmwatch_cache_cold_request_ratio", s["cold_frac"],
+              "Fraction of judged requests with under 10% cache reuse.")
+    if s.get("limit_frac") is not None:
+        gauge("llmwatch_token_limit_hit_ratio", s["limit_frac"],
+              "Fraction of requests that stopped by hitting their token limit.")
+
+    summary("llmwatch_ttft_milliseconds", s.get("ttft") or [],
+            "Time to first token, per request.")
+    summary("llmwatch_inter_token_milliseconds", s.get("itl") or [],
+            "Gap between consecutive streamed tokens.")
+    summary("llmwatch_queue_wait_milliseconds", s.get("queue") or [],
+            "Time spent waiting for a slot before prefill began.")
+    summary("llmwatch_prefill_milliseconds", s.get("prefill") or [],
+            "Time spent reading (prefilling) the prompt.")
+    summary("llmwatch_response_tokens", s.get("outputs") or [],
+            "Predicted token count, per response.")
+
+    return "\n".join(lines) + "\n"
 
 
 class Threaded(ThreadingHTTPServer):
@@ -909,6 +1030,7 @@ def main():
 
     base = "http://{}:{}".format(args.upstream_host, args.upstream_port)
     ProxyHandler.upstream = (args.upstream_host, args.upstream_port)
+    ProxyHandler.window = args.window
 
     if args.debug:
         raw = http_get(base + "/metrics")
@@ -937,6 +1059,13 @@ def main():
             except json.JSONDecodeError:
                 print("  unparseable: " + raw[:200])
         return 0
+
+    if args.log:
+        try:
+            LOG.open(args.log)
+        except OSError as e:
+            print("cannot open --log {}: {}".format(args.log, e))
+            return 1
 
     srv = None
     if not args.no_proxy:
@@ -970,6 +1099,7 @@ def main():
         sys.stdout.write(CSI + "?25h\n")
         if srv:
             srv.shutdown()
+        LOG.close()
     return 0
 
 

@@ -16,6 +16,8 @@ def build_parser(description):
     parser.add_argument("--upstream-port", type=int, default=8080)
     parser.add_argument("--window", type=int, default=60, help="rolling window seconds")
     parser.add_argument("--interval", type=float, default=0.5)
+    parser.add_argument("--log", metavar="PATH", default=None,
+                        help="append each measured request as a JSON line to PATH")
     parser.add_argument("--no-proxy", action="store_true",
                         help="render only; do not start the proxy")
     parser.add_argument("--ascii", action="store_true",

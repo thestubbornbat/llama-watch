@@ -122,6 +122,27 @@ The proxy preserves streaming responses and uses HTTP/1.1 chunked transfer
 encoding downstream. It removes hop-by-hop headers and generates its own
 transfer framing, avoiding conflicting upstream `Content-Length` headers.
 
+## Exporting what llama-watch sees
+
+The rolling window behind the dashboard holds at most 500 requests and lives
+only in memory. Two options carry it further:
+
+```bash
+# Append one JSON object per completed request (ttft, itl, cache_n, prompt_n,
+# queue_ms, stop_type, ...) to a file, for after-the-fact analysis.
+llama-watch --log requests.jsonl
+
+# Scrape the derived numbers llama.cpp's own /metrics cannot give you --
+# cache hit ratio, TTFT/inter-token-gap percentiles, the queue-vs-prefill
+# split -- as Prometheus exposition text.
+curl http://127.0.0.1:8081/llmwatch/metrics
+```
+
+`/llmwatch/metrics` is answered directly by the proxy (it is never forwarded
+upstream, so it can't collide with anything llama.cpp itself exposes) and
+reflects the same `--window` the dashboard uses. It is not counted as proxied
+traffic.
+
 ## Useful commands
 
 ```bash
