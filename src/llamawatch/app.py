@@ -379,11 +379,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def do_GET(self):
-        self._forward("GET")
+    def _dispatch(self):
+        self._forward(self.command)
 
-    def do_POST(self):
-        self._forward("POST")
+    # llama.cpp's HTTP surface isn't limited to GET/POST (CORS preflight uses
+    # OPTIONS; slot/props management can use PUT or DELETE). Forward every
+    # method the same way rather than silently 501-ing the rest.
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _dispatch
 
     def _forward(self, method):
         n = int(self.headers.get("Content-Length") or 0)
@@ -579,6 +581,23 @@ def ms(v):
 
 
 def draw(lines):
+    """Repaint in place. The dashboard's height varies with what the server
+    exposes (GPU panel, slot rows, ...) and can exceed a modest terminal --
+    writing past the last row forces the terminal to scroll, which permanently
+    pushes the redraw's home position off screen and turns "in place" updates
+    into a scrolling log. Cap to what actually fits instead.
+    """
+    # Only an interactive terminal can scroll out from under a redraw. When
+    # stdout is redirected (a log file, the e2e test's captured pipe) there is
+    # no real row count to respect, and shutil falls back to a fake 80x24-ish
+    # default that would truncate a perfectly good log for no reason.
+    if sys.stdout.isatty():
+        rows = shutil.get_terminal_size((100, 40)).lines
+        budget = max(1, rows - 1)
+        if len(lines) > budget:
+            hidden = len(lines) - (budget - 1)
+            lines = lines[:budget - 1] + [
+                T.chrome + "... {} more row(s) -- enlarge the terminal to see them".format(hidden) + T.off]
     out = [CSI + "H"]
     for ln in lines:
         out.append(ln + CSI + "K\n")

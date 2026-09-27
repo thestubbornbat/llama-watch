@@ -6,7 +6,7 @@ then sends both streaming and non-streaming completion requests through the
 proxy.  No llama.cpp installation, GPU, or third-party packages are required.
 
 Run:
-    python3 test_llmwatch.py
+    python -m unittest discover -s tests -v
 """
 
 import http.client
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -129,44 +130,50 @@ def wait_for_proxy(port, proc):
     raise RuntimeError("llmwatch proxy did not start")
 
 
-def main():
-    if not os.path.isfile(os.path.join(SRC, "llamawatch", "__main__.py")):
-        raise RuntimeError("cannot find the llamawatch package")
+class ProxyEndToEndTest(unittest.TestCase):
+    def test_proxy_preserves_responses_and_renders_metrics(self):
+        self.assertTrue(
+            os.path.isfile(os.path.join(SRC, "llamawatch", "__main__.py")),
+            "cannot find the llamawatch package")
 
-    upstream_port, proxy_port = free_port(), free_port()
-    upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), MockLlama)
-    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
-    thread.start()
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "llamawatch", "--listen", str(proxy_port),
-         "--upstream-port", str(upstream_port), "--interval", "0.05",
-         "--window", "60", "--ascii", "--no-color"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        env={**os.environ,
-             "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", "")})
-    try:
+        upstream_port, proxy_port = free_port(), free_port()
+        upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), MockLlama)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "llamawatch", "--listen", str(proxy_port),
+             "--upstream-port", str(upstream_port), "--interval", "0.05",
+             "--window", "60", "--ascii", "--no-color"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ,
+                 "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", "")})
+
+        def stop_proxy():
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+            return proc.communicate(timeout=5)
+
         wait_for_proxy(proxy_port, proc)
         streamed = request(proxy_port, {"stream": True, "prompt": "test"})
         plain = request(proxy_port, {"stream": False, "prompt": "test"})
-        assert b'"hello"' in streamed and b'" world"' in streamed, "SSE response changed"
-        assert json.loads(plain.decode())["content"] == "plain response", "plain response changed"
+        self.assertIn(b'"hello"', streamed, "SSE response changed")
+        self.assertIn(b'" world"', streamed, "SSE response changed")
+        self.assertEqual(json.loads(plain.decode())["content"], "plain response",
+                          "plain response changed")
         time.sleep(0.15)  # allow the dashboard to render the completed records
-    finally:
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)
-        stdout, stderr = proc.communicate(timeout=5)
-        upstream.shutdown()
-        upstream.server_close()
 
-    if proc.returncode not in (0, -signal.SIGINT):
-        raise RuntimeError("llmwatch failed:\n{}".format(stderr.decode("utf-8", "replace")))
-    screen = stdout.decode("utf-8", "replace")
-    for expected in ("PROMPT CACHE", "LATENCY", "CACHE IMPACT", "SLOTS & QUEUE",
-                     "reuse", "SERVER", "RESPONSE SIZE", "80 reused"):
-        assert expected in screen, "dashboard never rendered {!r}: {}".format(
-            expected, screen[-2000:])
-    print("PASS: proxy preserved streaming/plain responses and rendered request metrics")
+        stdout, stderr = stop_proxy()
+        self.assertIn(proc.returncode, (0, -signal.SIGINT),
+                      "llmwatch failed:\n{}".format(stderr.decode("utf-8", "replace")))
+        screen = stdout.decode("utf-8", "replace")
+        for expected in ("PROMPT CACHE", "LATENCY", "CACHE IMPACT", "SLOTS & QUEUE",
+                         "reuse", "SERVER", "RESPONSE SIZE", "80 reused"):
+            self.assertIn(expected, screen, "dashboard never rendered {!r}: {}".format(
+                expected, screen[-2000:]))
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

@@ -8,6 +8,62 @@ response size, slot state, server speed, and NVIDIA GPU state.
 It fills in measurements that `/metrics` alone cannot provide: cache reuse and
 latency are measured from requests as they pass through the proxy.
 
+## What it looks like
+
+A real run, mid-traffic, against a 4-slot `llama-server`:
+
+```
+llmwatch   proxy :8081 → :8080                                          19:40:45  last 60s  n=451
+
+╭─ PROMPT CACHE ──────────────────────────────────────────────────────────────────────────────────╮
+│ 100%  OK   ████████████████████████████████████████                                             │
+│ 243,540 reused  ·  451 re-read   ·  0% of requests cold                                          │
+╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭─ LATENCY ─────────────────────────────────────╮  ╭─ SLOTS & QUEUE ─────────────────────────────╮
+│ TTFT  time to first token                      │  │ deferred 0   slots/decode 2.01              │
+│ typical (p50)     12 ms  ▏                OK   │  │                                              │
+│ slow (p95)        17 ms  ▏                OK   │  │ SLOTS  1 of 4 busy  ████░░░░░░░░░░░░░░  OK   │
+│ worst (p99)       20 ms  ▎                OK   │  │  0 busy  prompt 557  cached 540  read 1      │
+│   first-token delay: waiting vs reading        │  │  0 busy  reuse ████████████████████▊░  OK    │
+│ wait for slot      0 ms                   OK   │  │  1 idle  prompt 564  cached 0  read 0        │
+│ read prompt       12 ms  ▏                OK   │  │  1 idle  reuse                        COLD   │
+│   mostly reading the prompt                    │  │  2 idle  prompt 563  cached 0  read 0        │
+│                                                 │  │  2 idle  reuse                        COLD   │
+│ TOKEN GAP  between streamed chunks             │  │  3 idle  prompt 565  cached 0  read 0        │
+│ typical (p50)     11 ms  ▏                OK   │  │  3 idle  reuse                        COLD   │
+│ slow (p95)        17 ms  ▏                OK   │  ╰──────────────────────────────────────────────╯
+│ worst (p99)       19 ms  ▎             ▁▂▇  OK │
+│                                                 │
+│ CACHE IMPACT  typical TTFT                     │
+│ mostly cached (451)  12 ms  ▏             OK   │
+╰─────────────────────────────────────────────────╯
+
+╭─ SERVER ───────────────────────────────────────────────────────────────────────────────────────╮
+│ REQUEST LOAD                                                                                    │
+│ active requests  1 / 4  ████████░░░░░░░░░░░░░░░░░░░░░░░░  OK                                    │
+│ completed through proxy  467     proxy errors  0     traffic  7.52 req/s                        │
+│                                                                                                  │
+│ MODEL SPEED                                                                                     │
+│ read prompt  93 tok/s     generate text  91 tok/s (currently processing)                        │
+│                                                                                                  │
+│ RESPONSE SIZE                                                                                   │
+│ typical  24 tokens                                                                              │
+│ long (p95)  29 tokens  ██░░░░░░░░░░░░░░░░░░░░░░░░░░  / 256                                       │
+│                                                                                                  │
+│ GPU                                                                                             │
+│ compute use                 85%  ██████████████████████████████████░░░░░░  HIGH                 │
+│ memory used  2,541 / 6,144 MiB  █████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░  OK                   │
+│ temperature                 84C  ███████████████████████████████████░░░░░  WARM                 │
+╰───────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ctrl-c to quit
+```
+
+In a real terminal the meters, `OK`/`SLOW`/`HIGH`/`COLD` labels, and sparklines are
+colored (green/amber/red), never color alone -- every state also carries a text
+label, so it degrades cleanly with `--ascii --no-color` too.
+
 ## Requirements
 
 - Python 3.9 or newer
